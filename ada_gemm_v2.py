@@ -270,7 +270,3 @@ def SM89_GEMM(M, N, K):
                         [B_reg.ptr_to([i]) for i in range(2)],  # B
                         c_ptrs,
                     )
-
-
-        def mma_v2(stage):
-            # 换一个迭代的方式, v1的控制流迭代方式
