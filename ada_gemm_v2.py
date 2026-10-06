@@ -69,13 +69,9 @@ def SM89_GEMM(M, N, K):
         # 分配 smem 内存
         pool = T.SMEMPool()
 
-        # smem 就绪
+        # mbarrier 设置
         smem_ready_bar = pool.alloc((PIPE_DEPTH,), "uint64", align=8)
-
-        # smem 消费完成，可以释放了
         smem_free_bar = pool.alloc((PIPE_DEPTH,), "uint64", align=8)
-
-        # acc_reg 设置
         acc_ready_bar = pool.alloc((PIPE_DEPTH,), "uint64", align=8)
         acc_free_bar = pool.alloc((PIPE_DEPTH,), "uint64", align=8)
 
@@ -83,6 +79,20 @@ def SM89_GEMM(M, N, K):
         Bsmem = pool.alloc([PIPE_DEPTH, BLK_N, BLK_K], b_type, layout=B_layout)
 
         pool.commit()
+
+        # mbarrier 初始化
+        if warp_id == 0 and lane_id == 0:
+            for s in range(PIPE_DEPTH):
+                T.ptx.mbarrier.init(smem_ready_bar.ptr_to([s]), 128)
+                T.ptx.mbarrier.init(smem_free_bar.ptr_to([s]), 128)
+                T.ptx.mbarrier.init(acc_ready_bar.ptr_to([s]), 128)
+                T.ptx.mbarrier.init(acc_free_bar.ptr_to([s]), 128)
+
+        T.cuda.cta_sync()  # 这一句有必要吗？
+
+        phase = T.alloc_local((PIPE_DEPTH,), "uint32")
+        for s in range(PIPE_DEPTH):
+            phase[s] = T.uint32(0)
 
         # C Reg 需要分配
         Creg = T.alloc_local(
@@ -97,25 +107,18 @@ def SM89_GEMM(M, N, K):
         # C_layout.storage() 去掉所有的warp\lane_id 分量，代表仅看线程内的分布
         # local(16, 8 )
 
-        # --- 接下来是 barrier 的初始化 ---
-        # 如果在cta 中实际上默认了，cta中的第一个thread才会执行
-        if warp_id == 0 and lane_id == 0:
-            for s in range(PIPE_DEPTH):
-                T.ptx.mbarrier.init(smem_ready_bar.ptr_to([s]), 128)
-                T.ptx.mbarrier.init(smem_free_bar.ptr_to([s]), 128)
-                T.ptx.mbarrier.init(acc_ready_bar.ptr_to([s]), 128)
-                T.ptx.mbarrier.init(acc_free_bar.ptr_to([s]), 128)
-
         """
             使用 cp_async
             BLK_M, BLK_K, BLK_N = 128, 64, 128
             每一个矩阵都是行主序，
             share memory 的 bank 宽度为 128B，swizzle的对齐宽度是16B
         """
+
         # 搬运 global memory -> share memory
         t_A = T.meta_var(
             (BLK_M * BLK_K * 2) // (4 * 16 * 32)
         )  # 32 * 4 (thread) * 16。A的搬运轮次
+
         t_B = T.meta_var((BLK_N * BLK_K * 2) // (4 * 16 * 32))
         warp_row = T.meta_var(
             (32 * 16) // (BLK_K * 2)
@@ -270,3 +273,137 @@ def SM89_GEMM(M, N, K):
                         [B_reg.ptr_to([i]) for i in range(2)],  # B
                         c_ptrs,
                     )
+
+        @T.inline
+        def mma_v2(stage):
+            # 进一步提高访存的局部性
+            row_warp_rounds = mma_rounds // mma_m_tiles  # 每一行的mma 轮数， 4
+            acc_per_res_tile = (MMA_M * MMA_N) // 32
+
+            for m_tile_idx in range(mma_m_tiles):
+                for k in range(k_steps):
+
+                    # 加载 A[m, k] -> reg
+                    a_r_offset = lane_id % 16
+                    a_c_offset = (lane_id // 16) * 8
+
+                    A_reg = T.alloc_local((4,), "uint32")
+                    T.ptx.ldmatrix(
+                        False,
+                        4,
+                        ".b16",
+                        Asmem.ptr_to(
+                            [
+                                stage,
+                                m_tile_idx * MMA_M + a_r_offset,
+                                k * MMA_K + a_c_offset,
+                            ]
+                        ),
+                        *[A_reg.ptr_to([i]) for i in range(4)]
+                    )
+
+                    # 加载 B
+                    # 这个B寄存器如何复用？
+                    B_reg = T.alloc_local((2,), "uint32")
+
+                    for n_in in range(row_warp_rounds):  # [0, 4]
+                        n_tile_idx = n_in * 4 + warp_id
+
+                        b_r_offset = lane_id % 8
+                        b_c_offset = (lane_id // 8) * 8
+
+                        B_reg = T.alloc_local((2,), "uint32")
+
+                        T.ptx.ldmatrix(
+                            False,
+                            2,
+                            ".b16",
+                            Bsmem.ptr_to(
+                                [
+                                    stage,
+                                    n_tile_idx * MMA_N + b_r_offset,
+                                    k * MMA_K + b_c_offset,
+                                ]
+                            ),
+                            *[B_reg.ptr_to([i]) for i in range(2)]
+                        )
+
+                        # 累加器结果位置? 我觉得这个很难写？能否优化编译器，改成直接 c layout 计算出应该在的位置，还是这意味着某种实现，根源上就不可以？
+                        c_ptrs = [
+                            Creg_thread.ptr_to(
+                                [
+                                    m_tile_idx * 2 + i // 2,
+                                    (n_tile_idx // 4) * 2 + i % 2,
+                                ]
+                            )
+                            for i in range(acc_per_res_tile)
+                        ]
+
+                        T.ptx.mma(
+                            "m16n8k16",
+                            "row",
+                            "col",
+                            "float32",
+                            "float16",
+                            "float16",
+                            "float32",
+                            c_ptrs,
+                            [A_reg.ptr_to([i]) for i in range(4)],
+                            [B_reg.ptr_to([i]) for i in range(2)],
+                            c_ptrs,
+                        )
+
+        # 接下来把 完整流程串起来。需要注意 t.barrier 的同步原语的使用。
+        # TODO； 这里有一个问题，sm9x 和 sm8x 的对应的barrier 如何使用？
+        # 注意每个指令的执行范围，这是一个二阶段流水。
+
+        # 阻塞等待，确定轮次完成后才继续执行。
+        @T.inline
+        def wait_phase(bar, p):  # bar = 地址， p = 数值
+            while T.ptx.mbarrier_test_wait_parity(bar, p) == 0:  # 非阻塞等待？
+                T.evaluate(0)
+
+        while tile_scheduler.valid():
+            m_st = T.meta_var(tile_scheduler.m_idx * BLK_M)
+            n_st = T.meta_var(tile_scheduler.n_idx * BLK_N)
+
+            # 清理 acc register
+            clean_acc_reg()
+
+            # 预填充，为什么要预填充？
+            for s in range(PIPE_DEPTH):
+                if s < K_STPS:
+                    # load
+                    load_gmem_to_smem(s, m_st, n_st, s * BLK_K)
+
+                    # 异步，登记复制完成事件：此前发出的复制，完成后做一次到达。此时不一定复制完成
+                    T.ptx.cp_async.mbarrier.arrive(smem_ready_bar.ptr_to([s]))  # +1 2
+
+                    # 意味着本轮已经登记提交完毕？
+                    T.ptx.mbarrier.arrive(smem_ready_bar.ptr_to([s]))  # -1 1
+
+                    # 以上两条指令不能交换，真实复制完成 - 1
+
+            for ki in range(K_STPS):
+                s: T.let = ki % PIPE_DEPTH  # 计算 归属 pipe phase
+
+                # 等待 golbal -> share mem
+                wait_phase(smem_ready_bar.ptr_to([s]), phase[s])
+
+                # 2. ldmatrix & mma
+                mma_v1(s)  # 同步还是异步？线程可以做其他的事情吗？
+
+                # 3. 报告本线程执行完毕
+                T.ptx.mbarrier.arrive(smem_free_bar.ptr_to([s]))
+
+                wait_phase(smem_ready_bar.ptr_to([s]), phase[s])
+
+                # load 下一个阶段
+                phase[s] = phase[s] ^ T.uint32(1)
+
+                if ki + PIPE_DEPTH < K_STPS:
+                    load_gmem_to_smem(s, m_st, n_st, (ki + PIPE_DEPTH) * BLK_K)
+                    T.ptx.cp_async.mbarrier.arrive(smem_ready_bar.ptr_to([s]))  # +1 2
+                    T.ptx.mbarrier.arrive(smem_ready_bar.ptr_to([s]))  # -1 1
+
+            tile_scheduler.next_tile()
