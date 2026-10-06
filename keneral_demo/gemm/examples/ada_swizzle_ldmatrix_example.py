@@ -1,8 +1,8 @@
 """SM8x 学习示例：A[16,64] global -> swizzled smem -> MMA 的 A fragment。
 
-运行（使用当前项目的 TIRx 版本）：
-    .venv/bin/python ada_swizzle_ldmatrix_example.py
-    .venv/bin/python ada_swizzle_ldmatrix_example.py --run-cuda
+从仓库根目录运行（使用当前项目的 TIRx 版本）：
+    .venv/bin/python keneral_demo/gemm/examples/ada_swizzle_ldmatrix_example.py
+    .venv/bin/python keneral_demo/gemm/examples/ada_swizzle_ldmatrix_example.py --run-cuda
 
 默认在 CPU 上验证地址映射，并解析、lower 真正的 TIRx kernel；不需要 GPU。
 --run-cuda 额外编译并运行 kernel，逐元素检查 GPU 导出的寄存器快照。

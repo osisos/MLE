@@ -1,5 +1,7 @@
 # GEMM
 
+代码与运行入口见 [GEMM kernel 示例](../keneral_demo/gemm/README.md)。
+
 ## Layout 的复合
 
 Layout A: tile -> reg

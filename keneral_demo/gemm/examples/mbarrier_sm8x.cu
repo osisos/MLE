@@ -1,8 +1,8 @@
-// CUDA 11.8+ examples:
-//   nvcc -std=c++17 -O2 -arch=sm_80 mbarrier_sm8x.cu -o mbarrier_sm8x
-//   nvcc -std=c++17 -O2 -arch=sm_86 mbarrier_sm8x.cu -o mbarrier_sm8x
-//   nvcc -std=c++17 -O2 -arch=sm_89 mbarrier_sm8x.cu -o mbarrier_sm8x
-// Run: ./mbarrier_sm8x
+// CUDA 11.8+ examples, run from the repository root:
+//   nvcc -std=c++17 -O2 -arch=sm_80 keneral_demo/gemm/examples/mbarrier_sm8x.cu -o /tmp/mbarrier_sm8x
+//   nvcc -std=c++17 -O2 -arch=sm_86 keneral_demo/gemm/examples/mbarrier_sm8x.cu -o /tmp/mbarrier_sm8x
+//   nvcc -std=c++17 -O2 -arch=sm_89 keneral_demo/gemm/examples/mbarrier_sm8x.cu -o /tmp/mbarrier_sm8x
+// Run: /tmp/mbarrier_sm8x
 // One CTA; each thread copies 16 bytes per round. No partial tiles.
 
 #include <cuda_runtime.h>

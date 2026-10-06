@@ -1,3 +1,5 @@
+"""SM89 GEMM：cp.async 双缓冲、mma.sync 累加与 CTA 整块写回。"""
+
 from typing import cast
 
 import tvm
@@ -6,18 +8,22 @@ from tvm.tirx import script as T
 from tvm.tirx.layout import TileLayout, S, laneid, warpid
 from tvm.backend.cuda.tile_primitive.tma_utils import mma_shared_layout, SwizzleMode
 from tvm.backend.cuda.lang.tile_scheduler import ClusterPersistentScheduler2D
+from tvm.tirx.script import tile as Tx
 
 SM_COUNT = 66
 
 
-# c = a *b + d
 def SM89_GEMM(M, N, K):
+    """构造 D = A @ B.T 的 kernel；M/N 按 128、K 按 64 整除。"""
     a_type, b_type = tvm.DataType("float16"), tvm.DataType("float16")
     d_type = tvm.DataType("float32")
 
     acc_type = tvm.DataType("float32")
 
     BLK_M, BLK_N, BLK_K = 128, 128, 64
+    assert M % BLK_M == 0, "M must be divisible by BLK_M (128)"
+    assert N % BLK_N == 0, "N must be divisible by BLK_N (128)"
+    assert K % BLK_K == 0, "K must be divisible by BLK_K (64)"
     K_STPS = K // BLK_K
     PIPE_DEPTH = 2
 
@@ -29,7 +35,7 @@ def SM89_GEMM(M, N, K):
     A_layout = mma_shared_layout(
         a_type,
         SwizzleMode.SWIZZLE_128B_ATOM,
-        [PIPE_DEPTH, BLK_M, BLK_N],
+        [PIPE_DEPTH, BLK_M, BLK_K],
     )
 
     B_layout = mma_shared_layout(
@@ -124,9 +130,7 @@ def SM89_GEMM(M, N, K):
             (32 * 16) // (BLK_K * 2)
         )  # 32个线程，每个线程16B，每个线程搬运 BLK * 2B，这里有一个问题，为什么
         chunks_per_row = T.meta_var((BLK_K * 2) // 16)  # chunks 每行
-        elems_per_copy = (
-            16 // 2
-        )  # 单线程一次 cp.async 搬运的元素数：16B / sizeof(float16)
+        elems_per_copy = T.meta_var(16 // 2)  # 16B / sizeof(float16)
 
         @T.inline
         def clean_acc_reg():
@@ -167,7 +171,7 @@ def SM89_GEMM(M, N, K):
 
                 T.ptx.cp_async(
                     Bsmem.ptr_to([stage, row, col]),
-                    B.ptr_to([n_offset + row, k_offset + row]),
+                    B.ptr_to([n_offset + row, k_offset + col]),
                     16,
                 )
 
@@ -179,16 +183,21 @@ def SM89_GEMM(M, N, K):
         MMA_K = T.meta_var(16)
         MMA_N = T.meta_var(8)
 
-        # 以输出的矩阵视角来看
-        mma_m_tiles = BLK_M // MMA_M  # 8
-        mma_n_tiles = BLK_N // MMA_N  # 16
-        k_steps = BLK_K // MMA_K  # 4
+        # 固定尺寸保留为元编程常量，避免生成运行时标量。
+        mma_m_tiles = T.meta_var(BLK_M // MMA_M)  # 8
+        mma_n_tiles = T.meta_var(BLK_N // MMA_N)  # 16
+        k_steps = T.meta_var(BLK_K // MMA_K)  # 4
 
-        mma_counts = mma_m_tiles * mma_n_tiles  # 总的输出矩阵的块数
-        mma_rounds = mma_counts // 4  # 每个warp负责的输出块
-        acc_pre_thread_round = (
-            MMA_M * MMA_N
-        ) // 32  # 4， 每个thread 每一轮负责的累加值
+        mma_counts = T.meta_var(mma_m_tiles * mma_n_tiles)  # 总的输出矩阵的块数
+        mma_rounds = T.meta_var(mma_counts // 4)  # 每个warp负责的输出块
+        acc_pre_thread_round = T.meta_var((MMA_M * MMA_N) // 32)
+
+        # 计算结果写回global memory中
+        @T.inline
+        def write_back(m_offset, n_offset):
+            Tx.cta.copy(
+                D[m_offset : m_offset + BLK_M, n_offset : n_offset + BLK_N], Creg[:, :]
+            )
 
         @T.inline
         def mma_v1(stage):
@@ -277,8 +286,8 @@ def SM89_GEMM(M, N, K):
         @T.inline
         def mma_v2(stage):
             # 进一步提高访存的局部性
-            row_warp_rounds = mma_rounds // mma_m_tiles  # 每一行的mma 轮数， 4
-            acc_per_res_tile = (MMA_M * MMA_N) // 32
+            row_warp_rounds = T.meta_var(mma_rounds // mma_m_tiles)  # 每行 4 轮
+            acc_per_res_tile = T.meta_var((MMA_M * MMA_N) // 32)
 
             for m_tile_idx in range(mma_m_tiles):
                 for k in range(k_steps):
@@ -396,14 +405,20 @@ def SM89_GEMM(M, N, K):
                 # 3. 报告本线程执行完毕
                 T.ptx.mbarrier.arrive(smem_free_bar.ptr_to([s]))
 
-                wait_phase(smem_ready_bar.ptr_to([s]), phase[s])
+                wait_phase(smem_free_bar.ptr_to([s]), phase[s])
 
                 # load 下一个阶段
                 phase[s] = phase[s] ^ T.uint32(1)
 
                 if ki + PIPE_DEPTH < K_STPS:
                     load_gmem_to_smem(s, m_st, n_st, (ki + PIPE_DEPTH) * BLK_K)
-                    T.ptx.cp_async.mbarrier.arrive(smem_ready_bar.ptr_to([s]))  # +1 2
-                    T.ptx.mbarrier.arrive(smem_ready_bar.ptr_to([s]))  # -1 1
+                    T.ptx.cp_async.mbarrier.arrive(
+                        smem_ready_bar.ptr_to([s])
+                    )  # +1 res = 2
+                    T.ptx.mbarrier.arrive(smem_ready_bar.ptr_to([s]))  # -1 res = 1
 
+            # 接一下 Creg 的结果返回
+            write_back(m_st, n_st)
             tile_scheduler.next_tile()
+
+    return kernel
