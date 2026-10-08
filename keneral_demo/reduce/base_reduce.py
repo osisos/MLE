@@ -5,6 +5,7 @@ WARPS_PER_CTA = 16
 
 
 def SM89_RRDUCE_SUM(N):
+    """规约练习：当前完成线程内与 warp 内求和，尚未合并各 warp 并写入 Y。"""
     elements_per_round = SM_COUNT * WARPS_PER_CTA * 32 * 8
     assert N > 0 and N % elements_per_round == 0, (
         f"暂不处理尾部：N 必须是 {elements_per_round} 的正整数倍"
@@ -62,8 +63,13 @@ def SM89_RRDUCE_SUM(N):
             Temp[0] = Temp[0] + Temp[1]
             thread_sum[0] = thread_sum[0] + Temp[0]
 
-        # 所有 lane 一起执行：32 个线程的部分和通过 shuffle 合并。
-        # 放在 r 循环外，每个 warp 只规约一次。
-        warp_sum = T.cuda.warp_reduce(thread_sum[0], "sum")
+        # 所有 32 个 lane 一起执行，依次与 lane_id XOR 16、8、4、2、1 交换值。
+        # shuffle 只交换寄存器值，后面的加法才执行规约。
+        for stage in T.unroll(5):
+            thread_sum[0] = thread_sum[0] + T.tvm_warp_shuffle_xor(
+                T.uint32(0xFFFFFFFF), thread_sum[0], 16 >> stage, 32, 32
+            )
+        # 每个 lane 都得到相同的本 warp 总和，供下一步合并各 warp 使用。
+        warp_sum = thread_sum[0]
 
     return kernel
